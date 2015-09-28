@@ -15,7 +15,7 @@ bc. pip install okcmd
 
 h2. Usage
 
-bc. okcmd -u your_username -p your_password -f 'message_output_file.txt'
+bc. okcmd -u your_username -p your_password -f message_output_file.mbox [-m mbox_format]
 
 
 
@@ -24,9 +24,9 @@ h3. Auto login links instead of a password
 @--autologin@ can be used instead of @--password@. Supply it with a link that will automatically log you in to OkCupid; you can find these links in emails sent to you from Okcupid. One example is the logotype in top/new matches emails - right click and choose "copy link", then use it with the @--autologin@ argument. Usage requires that _auto login from emails_ is enabled; check your privacy settings on the OKCupid web site.
 
 
-h3. "Thunderbird":https://www.google.com/url?sa=t&rct=j&q=&esrc=s&source=web&cd=1&ved=0CB4QFjAAahUKEwiHy4LIhsnHAhVBCCwKHQPvBEM&url=https%3A%2F%2Fwww.mozilla.org%2Fthunderbird%2F&ei=_-XeVcfPKcGQsAGD3pOYBA&usg=AFQjCNEXEPki7BAZim9dQdWY25jJg3CfFA&sig2=VmUtjGSPVtUbyx8YQOWh9w&cad=rja
+h3. Mailbox formats, formerly known as "Thunderbird" mode
 
-You can add the @-m@ or @-t@ flag to get the output as a possibly-MBOX-compatible file rather than the default plaintext format, but the feature hasn't been thoroughly tested. Put the file in a @Local@ folder, and hopefully Thunderbird (or pine/alpine/realpine) can read/process it from there. Please report back if it works or if there are any issues!
+The original plaintext mode has been deprecated; @okcmd@ now saves messages in classic 'mbox' format which is also easy to read in a text editor and doesn't required hand-crafted message formatting. Any of the formats supported by @mailbox@ can be specified with the @-m@ option. The generated mailbox has been tested with alpine and will likely work with Thunderbird if you place it in a @Local@ folder. Please report back if there are any issues!
 
 
 h3. Debugging

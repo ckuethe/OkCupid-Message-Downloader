@@ -11,73 +11,41 @@ import cookielib
 import urllib
 import urllib2
 import logging
+import mailbox
+import hashlib
+from unicodedata import normalize
+from email.utils import formatdate
 
 from bs4 import BeautifulSoup, NavigableString
 
+def asciify(s):
+    '''
+    Convert unicode into ascii approximation; mailbox doesn't like wider
+    characters and emoji. This transformation is lossy. Future versions of
+    this tool may achieve higher storage fidelity.
+    '''
+    try:
+        s = normalize('NFKD', s)
+    except TypeError:
+        # ignore "must be unicode, not str"
+        pass
+
+    try:
+        # TODO try convert unicodes to HTML entities?
+        s = s.encode('ascii', 'ignore')
+    except Exception:
+        pass
+    return s
 
 class Message:
-    def __init__(self, thread_url, sender, recipient, timestamp, subject, content, mbox=False):
-        self.thread_url = thread_url
+    def __init__(self, thread_url, sender, recipient, timestamp, subject, content, mailspool):
         self.sender = sender
         self.recipient = recipient
         self.timestamp = timestamp
         self.subject = subject
         self.content = content
-        self.mbox = mbox
-
-    def __str__(self):
-        if self.mbox:
-            msglength = len(self.content)
-            subject="OKC Message, length = " + str(msglength).zfill(4)  # leading zeros for message length
-            tstamp=self.timestamp.strftime('%a %b %d %H:%M:%S %Y') if self.timestamp else None
-            return """
-From - %s
-Date: %s
-From: %s
-To: %s
-Subject: %s
-
-%s
-URL: %s
-
-"""            % (  tstamp, tstamp,
-                    self.sender,
-                    self.recipient,
-                    subject,
-                    self.content,
-                    self.thread_url)
-        else:
-            return """
-URL: %s
-From: %s
-To: %s
-Date: %s
-Subject: %s
-Content-Length: %d
-
-%s
-
-"""            % (  self.thread_url,
-                    self.sender,
-                    self.recipient,
-                    self.timestamp,
-                    self.subject.strip() if self.subject else None,
-                    len(self.content),
-                    self.content
-                    )
-
-
-class MessageMissing(Message):
-
-    def __init__(self, thread_url):
         self.thread_url = thread_url
-        self.sender = None
-        self.recipient = None
-        self.timestamp = None
-        self.subject = None
-        self.content = "ERROR: message(s) not fetched"
-        self.mbox = False
-
+        self.mailspool = mailspool
 
 class ArrowFetcher:
     secure_base_url = 'https://www.okcupid.com'
@@ -93,23 +61,28 @@ class ArrowFetcher:
                       ('&quot;', '"'),
                       ('&#38;quot;', '"'),
                       ('&#39;', "'"),
-                      ('&rsquo;', u'\u2019'),
+                      ('&rsquo;', u'"'),
+                      ('&lsquo;', u'"'),
                       ('&mdash;', "--")]
-    # TODO: make a better "guess" about the time of the broadcast, account deletion, or Quiver match.
-    # Perhaps get the time of the next message/reply (there should be at least one), and set the time based on it.
-    fallback_date = datetime(2000, 1, 1, 12, 0)
+    # If all else fails, use a dummy timestamp for the message. Luckily
+    # most have messages have more specific timestamps, and the thread
+    # index also contains a timestamp which can be extracted, eg. quickmatch
+    # with deleted/inactive users.
+    fallback_date = datetime.now()
 
-    def __init__(self, username, mbox=False, debug=False, indexfile=None):
-        self.username = username
-        self.mbox = mbox
-        self.debug = debug
+    def __init__(self, options):
+	self.options = options
+        self.username = self.options.username
+        self.mailspool = self.options.mailspool
+        self.debug = self.options.debug
         self.thread_urls = []
-        self.indexfile = indexfile
-        if indexfile:
+        if self.options.indexfile:
+            # prevent local debugging sessions from connecting to server
             self.secure_base_url = 'https://localhost'
 
     def _safely_soupify(self, f):
-        f = f.partition("function autocoreError")[0] + '</body></html>' # wtf okc with the weirdly encoded "</scr' + 'ipt>'"-type statements in your javascript
+        # wtf okc with the weirdly encoded "</scr' + 'ipt>'"-type statements in your javascript
+        f = f.partition("function autocoreError")[0] + '</body></html>'
         return(BeautifulSoup(f, "html.parser"))
 
     def _request_read_sleep(self, url):
@@ -124,8 +97,8 @@ class ArrowFetcher:
                 page = 0
                 while (page < 1 if self.debug else True):
                     logging.info("Queuing folder %s, page %s", folder, page)
-                    if self.indexfile:
-                        f = urllib2.urlopen('file:'+self.indexfile).read()
+                    if self.options.indexfile:
+                        f = urllib2.urlopen('file:'+self.options.indexfile).read()
                     else:
                         f = self._request_read_sleep(self.secure_base_url + '/messages?folder=' + str(folder) + '&low=' + str((page * 30) + 1))
                     soup = self._safely_soupify(f)
@@ -134,6 +107,7 @@ class ArrowFetcher:
                     self.threadtimes = {}
                     for li in soup.find('ul', {'id': 'messages'}).find_all('li'):
                         threads.append('/messages?readmsg=true&threadid=' + li['data-threadid'])
+                        # TODO this probably needs to be more aggressive and better tested
                         fancydate_js = li.find('span', 'timestamp').find('script').string
                         timestamp = datetime.fromtimestamp(int(fancydate_js.split(', ')[1]))
                         self.threadtimes[ li['data-threadid'] ] = timestamp
@@ -143,7 +117,8 @@ class ArrowFetcher:
                     else:
                         self.thread_urls.extend(threads)
                         page = page + 1
-        except AttributeError:
+        except AttributeError as e:
+            logging.info(e)
             logging.error("There was an error queuing the threads to download - are you sure your username and password are correct?")
 
     def dedupe_threads(self):
@@ -159,18 +134,46 @@ class ArrowFetcher:
         for thread_url in self.thread_urls:
             try:
                 thread_messages = self._fetch_thread(thread_url)
+                self.messages.extend(thread_messages)
             except Exception as e:
-                thread_messages = [MessageMissing(self.secure_base_url + thread_url)]
                 logging.error("Fetch thread failed for URL: %s with error %s", thread_url, e)
-            self.messages.extend(thread_messages)
 
-    def write_messages(self, file_name):
-        self.messages.sort(key = lambda message: (message.thread_url, message.timestamp))  # sort by sender, then time
-        f = codecs.open(file_name, encoding='utf-8', mode='w')  # ugh, otherwise i think it will try to write ascii
+    def write_messages(self):
         for message in self.messages:
+            msg = mailbox.mboxMessage()
+            message.recipient = asciify(message.recipient)
+            message.sender = message.sender
+            message.content = asciify(message.content)
+
+            # TODO figure out how to set the in-reply-to header properly
+            mhash = hashlib.sha256(message.recipient + message.sender + tstamp + message.thread_url).hexdigest()
+            msg_id = "<%s.%s@okcupid.com>" % (message.sender, mhash)
+            if msg_id in self.options.mailindex:
+                logging.info("message-id %s already present in mailbox" % msg_id)
+                return
+            msglength = len(message.content)
+            # TODO compute better thread subject
+            if not message.subject:
+                subject = "OKC Message, length = " + str(msglength)
+
+            msg.add_header('Length', str(msglength))
+            msg.add_header('Date', message.timestamp)
+            msg.add_header('To', message.recipient)
+            msg.add_header('From', message.sender)
+            msg.set_unixfrom(message.sender)
+            msg.add_header('Subject', subject)
+            msg.add_header('Message-ID', msg_id)
+            msg.set_payload(message.content + "\n\n" + message.thread_url)
+
             logging.debug("Writing message for thread: " + message.thread_url)
-            f.write(unicode(message))
-        f.close()
+            try:
+                self.options.mailspool.add(msg)
+                self.options.mailspool.flush()
+                self.options.mailindex[msg_id] = True
+            except Exception as e:
+                logging.error("error writing message, thread %s (%s <==> %s)" %
+                    (message.thread_url, message.sender, message.recipient))
+                logging.error(e)
 
     def _fetch_thread(self, thread_url):
         message_list = []
@@ -198,18 +201,24 @@ class ArrowFetcher:
                 other_user = ''
         mutual_match_no_messages = thread_element.find_all('a', class_='mutual_match_no_messages')
         if len(list(mutual_match_no_messages)) == 1:
-            sender = other_user
-            recipient = self.username
-            timestamp = self.threadtimes.get(threadnum, self.fallback_date)
-            body = unicode("You like each other!")
+            sender = asciify(other_user)
+            recipient = asciify(self.username)
+            try:
+                timestamp = self.threadtimes[threadnum]
+            except KeyError:
+                timestamp = self.fallback_date
+                logging.warning('using fallback date for threadnum %s' % threadnum)
+            timestamp = formatdate(time.mktime(timestamp.timetuple()))
+            subject = "It's a match!"
+            body = "You like each other!"
             logging.debug("No message, only mutual match: %s", body)
             message_list.append(Message(self.secure_base_url + thread_url,
-                                        unicode(sender),
-                                        unicode(recipient),
+                                        sender,
+                                        recipient,
                                         timestamp,
                                         subject,
                                         body,
-                                        mbox=self.mbox))
+                                        self.options.mailspool))
         else:
             messages = thread_element.find_all('li')
             logging.debug("Raw messages (type: %s): %s", type(messages), messages)
@@ -233,6 +242,7 @@ class ArrowFetcher:
                         timestamp = datetime.fromtimestamp(int(fancydate_js.split(', ')[1]))
                     sender = other_user
                     recipient = self.username
+                    timestamp = formatdate(time.mktime(timestamp.timetuple()))
                     try:
                         if any(clazz.replace('preview', '').strip() == 'from_me' for clazz in message['class']):
                             recipient = other_user
@@ -241,12 +251,12 @@ class ArrowFetcher:
                         pass
                     logging.debug("Body: %s", body)
                     message_list.append(Message(self.secure_base_url + thread_url,
-                                                unicode(sender),
-                                                unicode(recipient),
+                                                sender,
+                                                recipient,
                                                 timestamp,
                                                 subject,
                                                 body,
-                                                mbox=self.mbox))
+                                                self.options.mailspool))
                 else:
                     continue  # control elements are also <li>'s in their html, so non-messages
         return message_list
@@ -267,36 +277,53 @@ class ArrowFetcher:
         return soup.encode_contents().decode('UTF-8')
 
 class OkcupidState:
-    def __init__(self, username, filename, mbox, debug, indexfile):
-        self.username = username
-        self.filename = filename
-        self.mbox = mbox
-        self.debug = debug
-        self.indexfile = indexfile
+    def __init__(self, options):
+        self.username = options.username
+        self.debug = options.debug
+        self.indexfile = options.indexfile
         self.cookie_jar = cookielib.CookieJar()
         self.opener = urllib2.build_opener(urllib2.HTTPCookieProcessor(self.cookie_jar))
         urllib2.install_opener(self.opener)
+
+        self.mailspool = None
+        options.mailformat = options.mailformat.lower()
+        if options.mailformat == 'mbox':
+             self.mailspool = mailbox.mbox(options.mailboxname)
+        elif options.mailformat == 'babyl':
+             self.mailspool = mailbox.Babyl(options.mailboxname)
+        elif options.mailformat == 'mh':
+             self.mailspool = mailbox.MH(options.mailboxname)
+        elif options.mailformat == 'mmdf':
+             self.mailspool = mailbox.MMDF(options.mailboxname)
+        elif options.mailformat == 'maildir':
+             self.mailspool = mailbox.Maildir(options.mailboxname)
+        else: # shouldn't be possible, but let's be careful anyway.
+             raise ValueError('Inappropriate mailbox format:', options.mailformat)
+        options.mailindex = {}
+        for _key, _value in map(lambda x: (x['Message-ID'], int(x['X-UID'])-1 ), self.mailspool):
+            mid_uid_map[_key] = _value
+        options.mailspool = self.mailspool
+
+
 
     def _setOpenerUrl(self, url, params=None):
         f = self.opener.open(url, params)
         f.close()
         logging.debug("Cookie jar: %s", self.cookie_jar)
 
-    def fetch(self):
-        arrow_fetcher = ArrowFetcher(
-            self.username,
-            mbox=self.mbox,
-            debug=self.debug,
-            indexfile=self.indexfile)
+    def fetch(self, options):
+        arrow_fetcher = ArrowFetcher(options)
         arrow_fetcher.queue_threads()
         arrow_fetcher.dedupe_threads()
         try:
             arrow_fetcher.fetch_threads()
-            arrow_fetcher.write_messages(self.filename)
+            arrow_fetcher.write_messages()
         except KeyboardInterrupt:
-            if self.debug:  # Write progress so far to the output file if we're debugging
-                arrow_fetcher.write_messages(self.filename)
+            arrow_fetcher.mailspool.flush()
+            arrow_fetcher.mailspool.close()
             raise KeyboardInterrupt
+        arrow_fetcher.mailspool.flush()
+        arrow_fetcher.mailspool.close()
 
     def use_password(self, password):
         logging.debug("Using password.")
@@ -312,8 +339,8 @@ class OkcupidState:
         self._setOpenerUrl('file:'+indexfile)
 
 def main():
-    usage =  "okcmd -u your_username -p your_password -f 'message_output_file.txt'"
-    description = "OkCupid-Message-Downloader (OKCMD): a tool for downloading your sent and received OkCupid messages to a text file."
+    usage =  "okcmd -u username [-p <password>|-a <login_url>] -f <okc_mail.mbox> [-m mbox_format]"
+    description = "OkCupid-Message-Downloader (OKCMD): a tool for downloading your sent and received OkCupid mail to a standard mailbox."
     epilog = "See also https://github.com/lehrblogger/OkCupid-Message-Downloader"
     # TODO: add version argument based on setup.py's version number.
     #version = "okcmd 1.3"
@@ -324,13 +351,13 @@ def main():
                       help="your OkCupid password")
     parser.add_option("-a", "--autologin", dest="autologin",
                       help="a link from an OkCupid email, which contains your login credentials; use instead of a password")
-    parser.add_option("-f", "--filename", dest="filename",
-                      help="the file to which you want to write the data")
-    parser.add_option("-m", "--mbox", dest="mbox",
-                      help="format output as MBOX rather than as plaintext",
-                      action='store_const', const=True, default=False)
-    parser.add_option("-t", "--thunderbird", dest="mbox",
-                      help="format output for Thunderbird rather than as plaintext",
+    parser.add_option("-f", "--filename", dest="mailboxname",
+                      help="the file to which you want to write the data; default 'okc_mail.$USERNAME.$FORMAT'")
+    parser.add_option("-m", "--mailformat", dest="mailformat", default='mbox',
+                      choices=['mbox', 'maildir', 'mh', 'mmdf', 'babyl'],
+                      help="mailbox output format: mbox, maildir, mh, text, ...")
+    parser.add_option("-v", "--verbose", dest="verbose",
+                      help="increase informational output",
                       action='store_const', const=True, default=False)
     parser.add_option("-d", "--debug", dest="debug",
                       help="limit the number of threads fetched for debugging, and output raw HTML",
@@ -340,16 +367,22 @@ def main():
     (options, args) = parser.parse_args()
     options_ok = True
     logging_format = '%(levelname)s: %(message)s'
+
     if options.indexfile:
         options.debug = True
-        options.username = 'staff_robot'
+        if not options.username:
+            options.username = 'staff_robot'
         options.password = 'he@rtl3ss!'
 
     if options.debug:
         logging.basicConfig(format=logging_format, level=logging.DEBUG)
         logging.debug("Debug mode turned on.")
-    else:
+    elif options.verbose:
         logging.basicConfig(format=logging_format, level=logging.INFO)
+        logging.debug("Verbose mode turned on.")
+    else:
+        logging.basicConfig(format=logging_format, level=logging.WARNING)
+
     if not options.username:
         logging.error("Please specify your OkCupid username with either '-u' or '--username'")
         options_ok = False
@@ -359,20 +392,21 @@ def main():
     if options.autologin and options.password:
         logging.error("Don't specify both autologin and password")
         options_ok = False
-    if not options.filename:
-        logging.error("Please specify the destination file with either '-f' or '--filename'")
-        options_ok = False
     if not options_ok:
         logging.error("See 'okcmd --help' for all options.")
     else:
-        state = OkcupidState(options.username, options.filename, options.mbox, options.debug, options.indexfile)
+        if not options.mailboxname:
+	    options.mailboxname = 'okc_mail.%s.%s' %(options.username, options.mailformat)
+            logging.debug("using default mailbox: " + options.mailboxname)
+
+        state = OkcupidState(options)
         if options.indexfile:
             state.use_indexfile(options.indexfile)
         elif options.username and options.password:
             state.use_password(options.password)
         elif options.autologin:
             state.use_autologin(options.autologin)
-        state.fetch()
+        state.fetch(options)
     logging.info("Done.")
 
 if __name__ == '__main__':

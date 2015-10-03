@@ -146,7 +146,7 @@ class ArrowFetcher:
             message.content = asciify(message.content)
 
             # TODO figure out how to set the in-reply-to header properly
-            mhash = hashlib.sha256(message.recipient + message.sender + tstamp + message.thread_url).hexdigest()
+            mhash = hashlib.sha256(message.recipient + message.sender + message.timestamp + message.thread_url).hexdigest()
             msg_id = "<%s.%s@okcupid.com>" % (message.sender, mhash)
             if msg_id in self.options.mailindex:
                 logging.info("message-id %s already present in mailbox" % msg_id)
@@ -236,10 +236,16 @@ class ArrowFetcher:
                         body = body.replace(unicode(find), unicode(replace))
                     logging.debug("Message after HTML entity conversion: %s", body)
                     if message_type in ['broadcast', 'deleted', 'quiver']:
-                        timestamp = self.threadtimes.get(threadnum, self.fallback_date)
+                        fancydate_js = message.find('span', 'timestamp').find('script').string
+                        if fancydate_js:
+                            timestamp = datetime.fromtimestamp(int(fancydate_js.split(', ')[1]))
+                            self.threadtimes[threadnum] = timestamp
+                        else:
+                            timestamp = self.threadtimes.get(threadnum, self.fallback_date)
                     else:
                         fancydate_js = message.find('span', 'timestamp').find('script').string
                         timestamp = datetime.fromtimestamp(int(fancydate_js.split(', ')[1]))
+                        self.threadtimes[threadnum] = timestamp
                     sender = other_user
                     recipient = self.username
                     timestamp = formatdate(time.mktime(timestamp.timetuple()))
